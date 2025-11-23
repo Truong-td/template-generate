@@ -8,6 +8,7 @@ import java.util.regex.Pattern;
 public class DocxTemplateEngine {
 
     // {{name}} hoặc {{application.name}}
+    // {{name}} hoặc {{application.name}}
     private static final Pattern PLACEHOLDER_PATTERN =
             Pattern.compile("\\{\\{(\\w+(?:\\.\\w+)*)}}");
 
