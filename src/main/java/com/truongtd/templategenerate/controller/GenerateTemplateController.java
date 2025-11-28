@@ -19,10 +19,10 @@ public class GenerateTemplateController {
     }
 
     @PostMapping(
-            value = "/generate",
+            value = "/generate/template-document",
             produces = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     )
-    public ResponseEntity<byte[]> generate(@RequestBody CreateTemplateRequest request) throws Exception {
+    public ResponseEntity<byte[]> generate(@RequestBody GenerateTemplateRequest request) throws Exception {
         byte[] fileBytes = templateService.generateDocx(request);
 
         String filename = "report-" + System.currentTimeMillis() + ".docx";

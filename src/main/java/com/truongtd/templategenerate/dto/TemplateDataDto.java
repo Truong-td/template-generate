@@ -1,6 +1,8 @@
 package com.truongtd.templategenerate.dto;
 
 import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
 
 import java.util.Map;
 

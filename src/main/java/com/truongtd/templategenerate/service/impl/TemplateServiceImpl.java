@@ -8,6 +8,7 @@ import com.truongtd.templategenerate.request.CreateTemplateRequest;
 import com.truongtd.templategenerate.service.TemplateService;
 import jakarta.annotation.PostConstruct;
 import lombok.val;
+import org.apache.commons.compress.utils.IOUtils;
 import org.docx4j.TraversalUtil;
 import org.docx4j.XmlUtils;
 import org.docx4j.convert.in.xhtml.XHTMLImporterImpl;
@@ -22,6 +23,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.ByteArrayOutputStream;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -41,36 +43,33 @@ public class TemplateServiceImpl implements TemplateService {
 
     private final DocxTemplateEngine templateEngine = new DocxTemplateEngine();
     private final TemplateContextBuilder contextBuilder = new TemplateContextBuilder();
+    private final TableDataService tableDataService;
 
-    // Block list/object: {{students}} ... {{/students}}
-    private static final Pattern BLOCK_START_PATTERN =
-            Pattern.compile("^\\s*\\{\\{(\\w+)}}\\s*$");
+    //    // Block list/object: {{students}} ... {{/students}}
+//    private static final Pattern BLOCK_START_PATTERN =
+//            Pattern.compile("^\\s*\\{\\{(\\w+)}}\\s*$");
+//
+//    // Conditional block: {{?user}} ... {{/user}}
+//    private static final Pattern COND_START_PATTERN =
+//            Pattern.compile("^\\s*\\{\\{\\?(\\w+)}}\\s*$");
+//
+//    // Block end: {{/students}}
+//    private static final Pattern BLOCK_END_PATTERN =
+//            Pattern.compile("^\\s*\\{\\{/(\\w+)}}\\s*$");
+//
+//    // Row template trong bảng: {{students.name}}
+//    private static final Pattern ROW_LIST_PLACEHOLDER =
+//            Pattern.compile("\\{\\{(\\w+)\\.[^}]+}}");
+//
+//    // Factory tạo node wml
+//    private static final ObjectFactory WML_FACTORY = new ObjectFactory();
+    public static final Pattern BLOCK_START = Pattern.compile("\\{\\{\\?(.*?)}}");
+    public static final Pattern BLOCK_END   = Pattern.compile("\\{\\{/(.*?)}}");
+    public static final Pattern SCALAR      = Pattern.compile("\\{\\{([^{}]+)}}");
 
-    // Conditional block: {{?user}} ... {{/user}}
-    private static final Pattern COND_START_PATTERN =
-            Pattern.compile("^\\s*\\{\\{\\?(\\w+)}}\\s*$");
-
-    // Block end: {{/students}}
-    private static final Pattern BLOCK_END_PATTERN =
-            Pattern.compile("^\\s*\\{\\{/(\\w+)}}\\s*$");
-
-    // Row template trong bảng: {{students.name}}
-    private static final Pattern ROW_LIST_PLACEHOLDER =
-            Pattern.compile("\\{\\{(\\w+)\\.[^}]+}}");
-
-    // Factory tạo node wml
-    private static final ObjectFactory WML_FACTORY = new ObjectFactory();
-
-    // FlexData markers
-    private static final Pattern IMG_PATTERN =
-            Pattern.compile("\\{\\{IMG:([^}]+)}}");
-    private static final Pattern HTML_PATTERN =
-            Pattern.compile("\\{\\{HTML:([^}]+)}}");
-    private static final Pattern TABLE2D_PATTERN =
-            Pattern.compile("\\{\\{TABLE:([^}]+)}}");
-
-    // HTTP client để tải ảnh
-    private static final HttpClient HTTP_CLIENT = HttpClient.newHttpClient();
+    public TemplateServiceImpl(TableDataService tableDataService) {
+        this.tableDataService = tableDataService;
+    }
 
     @PostConstruct
     public void checkTemplateExists() {
@@ -85,182 +84,374 @@ public class TemplateServiceImpl implements TemplateService {
     }
 
     @Override
-    public byte[] generateDocx(CreateTemplateRequest request) throws Exception {
-        TemplateDataDto templateDataDto = TemplateMapper.convert(request);
-        Map<String, Object> rootContext = contextBuilder.buildContext(templateDataDto);
-        log.debug("Context dùng để render: {}", rootContext);
+    public byte[] generateDocx(GenerateTemplateRequest request) throws Exception {
 
-        WordprocessingMLPackage wordMLPackage = loadTemplate();
-        MainDocumentPart mainDocumentPart = wordMLPackage.getMainDocumentPart();
+        try {
+            TemplateDataDto templateDataDto = JsonUtils.parse(request);
 
-        // 1. TableData -> 1 bảng nhiều dòng
-        processTablesForList(mainDocumentPart, rootContext);
+            // 1. Load file mẫu generateTemplate.docx từ resources/templates
+            WordprocessingMLPackage wordMLPackage = loadTemplate();
 
-        // 2. Block list/object + conditional + scalar cho toàn document
-        processDocument(mainDocumentPart, rootContext);
+            // 2. Build root context cho textData + tableData
+            Map<String, Object> context = contextBuilder.buildRootContext(templateDataDto);
 
-        // 3. FlexData: IMG / HTML / TABLE2D
-        processFlex(mainDocumentPart, rootContext, wordMLPackage);
+            // 3. Xử lý FlexData: {{historyFormation}}
+            processFlexData(wordMLPackage, templateDataDto.getFlexData());
 
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        wordMLPackage.save(out);
-        return out.toByteArray();
-    }
+            // 5. Xử lý TableData: lặp danh sách students, subjects...
+            tableDataService.processTableData(wordMLPackage, context);
 
-    private void processFlex(MainDocumentPart mainDocumentPart,
-                             Map<String, Object> rootContext,
-                             WordprocessingMLPackage wordMLPackage) throws Exception {
+            // 4. Xử lý TextData: scalar + block ẩn/hiện ({{?key}}...{{/key}})
+            processTextBlocks(wordMLPackage, context);
 
-        Document doc = (Document) mainDocumentPart.getJaxbElement();
-        List<Object> bodyContent = doc.getBody().getContent();
+            cleanupEmptyParagraphs(wordMLPackage);
 
-        for (int i = 0; i < bodyContent.size(); i++) {
-            Object el = bodyContent.get(i);
-            Object u = XmlUtils.unwrap(el);
-
-            if (!(u instanceof P p)) {
-                continue;
-            }
-
-            String text = getParagraphText(p);
-            if (text == null) continue;
-
-            // IMG
-            Matcher imgM = IMG_PATTERN.matcher(text);
-            if (imgM.find()) {
-                String key = imgM.group(1).trim(); // ví dụ "note.image"
-                Object val = resolveKey(key, rootContext);
-                if (val != null) {
-                    try {
-                        P imgPara = createImageParagraph(wordMLPackage, val.toString());
-                        bodyContent.set(i, imgPara);
-                    } catch (Exception e) {
-                        log.error("Lỗi chèn ảnh cho key {}", key, e);
-                    }
-                } else {
-                    log.warn("Không tìm thấy dữ liệu ảnh cho key {}", key);
-                }
-                continue;
-            }
-
-            // HTML
-            Matcher htmlM = HTML_PATTERN.matcher(text);
-            if (htmlM.find()) {
-                String key = htmlM.group(1).trim(); // ví dụ "note.html"
-                Object val = resolveKey(key, rootContext);
-                if (val != null) {
-                    try {
-                        List<Object> htmlNodes = convertHtmlToNodes(mainDocumentPart, val.toString());
-                        // Xoá paragraph chứa marker, chèn HTML tại vị trí đó
-                        bodyContent.remove(i);
-                        bodyContent.addAll(i, htmlNodes);
-                        i += htmlNodes.size() - 1;
-                    } catch (Exception e) {
-                        log.error("Lỗi chèn HTML cho key {}", key, e);
-                    }
-                } else {
-                    log.warn("Không tìm thấy dữ liệu HTML cho key {}", key);
-                }
-                continue;
-            }
-
-            // TABLE2D
-            Matcher tblM = TABLE2D_PATTERN.matcher(text);
-            if (tblM.find()) {
-                String key = tblM.group(1).trim(); // ví dụ "note.table"
-                Object val = resolveKey(key, rootContext);
-                if (val instanceof List<?>) {
-                    try {
-                        Tbl tbl = createTableFrom2D((List<?>) val);
-                        bodyContent.set(i, tbl);
-                    } catch (Exception e) {
-                        log.error("Lỗi chèn TABLE cho key {}", key, e);
-                    }
-                } else {
-                    log.warn("Dữ liệu TABLE cho key {} không phải List", key);
-                }
-            }
-        }
-    }
-
-    private P createImageParagraph(WordprocessingMLPackage wordMLPackage, String url) throws Exception {
-        byte[] bytes = downloadImage(url);
-        if (bytes == null || bytes.length == 0) {
-            throw new IllegalStateException("Không tải được ảnh từ URL: " + url);
+            // 6. Xuất docx ra mảng byte
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            wordMLPackage.save(out);
+            return out.toByteArray();
+        } catch (Exception e) {
+            throw new RuntimeException("Error generating template", e);
         }
 
-        BinaryPartAbstractImage imagePart =
-                BinaryPartAbstractImage.createImagePart(wordMLPackage, bytes);
-
-        // Kích thước ảnh (đơn vị EMU) – tạm approx 400x300 px
-        long cx = 400L * 9525L;
-        long cy = 300L * 9525L;
-
-        Inline inline = imagePart.createImageInline(
-                "flex-img", "Flex image", 0, 1, cx, cy, false);
-
-        Drawing drawing = WML_FACTORY.createDrawing();
-        drawing.getAnchorOrInline().add(inline);
-
-        R run = WML_FACTORY.createR();
-        run.getContent().add(drawing);
-
-        P p = WML_FACTORY.createP();
-        p.getContent().add(run);
-        return p;
-    }
-
-    private byte[] downloadImage(String url) throws Exception {
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .GET()
-                .build();
-
-        HttpResponse<byte[]> response =
-                HTTP_CLIENT.send(request, HttpResponse.BodyHandlers.ofByteArray());
-
-        if (response.statusCode() >= 200 && response.statusCode() < 300) {
-            return response.body();
-        } else {
-            log.warn("Tải ảnh thất bại {} - status {}", url, response.statusCode());
-            return null;
-        }
-    }
-
-    private List<Object> convertHtmlToNodes(MainDocumentPart mainDocumentPart, String html) throws Exception {
-        WordprocessingMLPackage wordMLPackage = loadTemplate();
-        XHTMLImporterImpl importer =
-                new XHTMLImporterImpl(wordMLPackage);
-        // html có thể là đoạn <p>... hoặc <div>...
-        return importer.convert(html, null);
     }
 
     @SuppressWarnings("unchecked")
-    private Tbl createTableFrom2D(List<?> rows) {
-        Tbl tbl = WML_FACTORY.createTbl();
+    private void processFlexData(WordprocessingMLPackage pkg, Map<String, Object> flexData) throws Exception {
+        if (flexData == null) return;
 
-        for (Object rowObj : rows) {
-            if (!(rowObj instanceof List<?> cols)) {
-                continue;
+        for (Map.Entry<String, Object> e : flexData.entrySet()) {
+            String key = e.getKey();      // ví dụ: historyFormation, collateralInfo, timeline...
+            Object val = e.getValue();
+
+            if (val instanceof List<?>) {
+                processOneFlexBlock(pkg, key, (List<Object>) val);
             }
-            Tr tr = WML_FACTORY.createTr();
+        }
+    }
 
-            for (Object col : cols) {
-                Tc tc = WML_FACTORY.createTc();
-                P p = WML_FACTORY.createP();
-                Text t = WML_FACTORY.createText();
-                t.setValue(col != null ? col.toString() : "");
-                R r = WML_FACTORY.createR();
+    private void processOneFlexBlock(WordprocessingMLPackage pkg,
+                                     String placeholderKey,
+                                     List<Object> blocks) throws Exception {
+        MainDocumentPart main = pkg.getMainDocumentPart();
+        Body body = main.getContents().getBody();
+
+        String tag = "{{" + placeholderKey + "}}";
+
+        // tìm paragraph chứa {{placeholderKey}}
+        P placeholderPara = null;
+        for (Object obj : body.getContent()) {
+            Object u = XmlUtils.unwrap(obj);
+            if (u instanceof P) {
+                P p = (P) u;
+                if (getParagraphText(p).contains(tag)) {
+                    placeholderPara = p;
+                    break;
+                }
+            }
+        }
+        if (placeholderPara == null) return;
+
+        int insertIndex = body.getContent().indexOf(placeholderPara);
+        body.getContent().remove(placeholderPara);
+
+        for (Object o : blocks) {
+            if (!(o instanceof Map)) continue;
+            Map<String, Object> block = (Map<String, Object>) o;
+            String type = (String) block.get("type");
+
+            switch (type) {
+                case "text":
+                    body.getContent().add(insertIndex++, createTextParagraph(block));
+                    break;
+                case "table":
+                    body.getContent().add(insertIndex++, createTableFromFlex(block));
+                    break;
+                case "image":
+                    body.getContent().add(insertIndex++, createImageParagraph(pkg, block));
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private P createTextParagraph(Map<String, Object> block) {
+        Map<String, Object> textData = (Map<String, Object>) block.get("textData");
+        String data = textData != null ? (String) textData.get("data") : "";
+        Boolean isBold = textData != null && Boolean.TRUE.equals(textData.get("isBold"));
+
+        P p = new P();
+        R r = new R();
+        Text t = new Text();
+        t.setValue(data);
+        r.getContent().add(t);
+
+        if (isBold) {
+            RPr rPr = new RPr();
+            BooleanDefaultTrue b = new BooleanDefaultTrue();
+            rPr.setB(b);
+            r.setRPr(rPr);
+        }
+
+        p.getContent().add(r);
+        return p;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Tbl createTableFromFlex(Map<String, Object> block) {
+        Map<String, Object> tableData = (Map<String, Object>) block.get("tableData");
+        List<List<Map<String, Object>>> matrix =
+                (List<List<Map<String, Object>>>) tableData.get("data");
+        List<Double> colSizes = (List<Double>) tableData.get("colSizes");
+
+        Tbl tbl = new Tbl();
+
+        for (List<Map<String, Object>> rowData : matrix) {
+            Tr tr = new Tr();
+            for (int i = 0; i < rowData.size(); i++) {
+                Map<String, Object> cellData = rowData.get(i);
+                String text = (String) cellData.get("data");
+                Boolean isBold = Boolean.TRUE.equals(cellData.get("isBold"));
+
+                Tc tc = new Tc();
+                P p = new P();
+                R r = new R();
+                Text t = new Text();
+                t.setValue(text != null ? text : "");
                 r.getContent().add(t);
+
+                if (isBold) {
+                    RPr rPr = new RPr();
+                    rPr.setB(new BooleanDefaultTrue());
+                    r.setRPr(rPr);
+                }
+
                 p.getContent().add(r);
                 tc.getContent().add(p);
                 tr.getContent().add(tc);
             }
-
             tbl.getContent().add(tr);
         }
 
+        // nếu cần set width theo colSizes anh có thể bổ sung TcPr/TblGrid ở đây
         return tbl;
+    }
+
+    @SuppressWarnings("unchecked")
+    private P createImageParagraph(WordprocessingMLPackage pkg, Map<String, Object> block) throws Exception {
+        Map<String, Object> imageData = (Map<String, Object>) block.get("imageData");
+        if (imageData == null) return new P();
+
+        String bucket = (String) imageData.get("bucket");
+        String path = (String) imageData.get("path");
+        // TODO: anh tự implement load bytes từ S3 hoặc file local
+        byte[] bytes = loadImageBytes(bucket, path);
+
+        BinaryPartAbstractImage imagePart = BinaryPartAbstractImage
+                .createImagePart(pkg, bytes);
+
+        Inline inline = imagePart.createImageInline("history-img", "history-img",
+                0, 1, 6000, false);
+
+        R r = new R();
+        Drawing drawing = new Drawing();
+        drawing.getAnchorOrInline().add(inline);
+        r.getContent().add(drawing);
+        P p = new P();
+        p.getContent().add(r);
+        return p;
+    }
+
+    private byte[] loadImageBytes(String bucket, String path) {
+        // ví dụ tạm: đọc từ local cho dễ debug
+        try (InputStream is = new FileInputStream("/tmp/" + path.substring(path.lastIndexOf('/') + 1))) {
+            return IOUtils.toByteArray(is);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private void processTextBlocks(WordprocessingMLPackage pkg, Map<String, Object> root) throws Docx4JException {
+        List<Object> paragraphs = getAllParagraphs(pkg);
+
+        // Xử lý block theo dạng: start -> các paragraph bên trong -> end
+        boolean insideBlock = false;
+        String currentKey = null;
+        List<P> buffer = new ArrayList<>();
+
+        for (Iterator<Object> it = paragraphs.iterator(); it.hasNext(); ) {
+            Object obj = it.next();
+            P p = (P) XmlUtils.unwrap(obj);
+
+            String text = getParagraphText(p);
+            Matcher startM = BLOCK_START.matcher(text);
+            Matcher endM   = BLOCK_END.matcher(text);
+
+            if (!insideBlock && startM.find()) {
+                // bắt đầu block
+                insideBlock = true;
+                currentKey = startM.group(1).trim();
+                buffer.clear();
+                buffer.add(p); // paragraph chứa {{?key}}
+                continue;
+            }
+
+            if (insideBlock) {
+                buffer.add(p);
+                if (endM.find()) {
+                    // kết thúc block, quyết định show/hide
+                    boolean show = isTruthy(resolveKey(root, currentKey));
+                    if (show) {
+                        // render từng paragraph trong buffer: remove {{?key}}, {{/key}} và scalar
+                        for (P blockP : buffer) {
+                            String t = getParagraphText(blockP);
+                            t = t.replace("{{?" + currentKey + "}}", "")
+                                    .replace("{{/" + currentKey + "}}", "");
+
+                            t = replaceScalars(t, root, currentKey);
+
+                            // Nếu sau khi xoá marker + replace mà paragraph trống hoàn toàn -> xoá hẳn
+                            if (t == null || t.trim().isEmpty()) {
+                                deleteParagraph(pkg, blockP);
+                            } else {
+                                setParagraphText(blockP, t);
+                            }
+                        }
+                    } else {
+                        // xóa toàn bộ block
+                        for (P blockP : buffer) {
+                            deleteParagraph(pkg, blockP);
+                        }
+                    }
+
+                    insideBlock = false;
+                    currentKey = null;
+                    buffer.clear();
+                }
+                continue;
+            }
+
+            // ngoài block: chỉ thay scalar bình thường
+            String replaced = replaceScalars(text, root, null);
+            setParagraphText(p, replaced);
+        }
+    }
+
+    private void cleanupEmptyParagraphs(WordprocessingMLPackage pkg) throws Docx4JException {
+        Body body = pkg.getMainDocumentPart().getContents().getBody();
+        List<Object> content = body.getContent();
+
+        boolean prevEmpty = false;
+        Iterator<Object> it = content.iterator();
+
+        while (it.hasNext()) {
+            Object o = XmlUtils.unwrap(it.next());
+            if (!(o instanceof P)) {
+                prevEmpty = false; // reset nếu gặp bảng / hình / gì khác
+                continue;
+            }
+
+            P p = (P) o;
+            String txt = getParagraphText(p).trim();
+            boolean isEmpty = txt.isEmpty();
+
+            if (isEmpty) {
+                if (prevEmpty) {
+                    // 2 paragraph trống liên tiếp -> bỏ cái thứ 2 trở đi
+                    it.remove();
+                } else {
+                    prevEmpty = true;
+                }
+            } else {
+                prevEmpty = false;
+            }
+        }
+    }
+    private List<Object> getAllParagraphs(WordprocessingMLPackage pkg) {
+        try {
+            return pkg.getMainDocumentPart()
+                    .getJAXBNodesViaXPath("//w:p", true);
+        } catch (Exception e) {
+            throw new RuntimeException("Cannot read paragraphs", e);
+        }
+    }
+
+    private void setParagraphText(P p, String newText) {
+        // clear all run and replace bằng 1 run mới
+        p.getContent().clear();
+        R run = new R();
+        Text text = new Text();
+        text.setValue(newText);
+        run.getContent().add(text);
+        p.getContent().add(run);
+    }
+
+    private void deleteParagraph(WordprocessingMLPackage pkg, P p) throws Docx4JException {
+        Body body = pkg.getMainDocumentPart().getContents().getBody();
+        body.getContent().remove(p);
+    }
+
+    // isTruthy: cho Trường hợp 1 & 2
+    private boolean isTruthy(Object value) {
+        if (value == null) return false;
+        if (value instanceof Boolean) return (Boolean) value;
+        if (value instanceof String) return !((String) value).trim().isEmpty();
+        if (value instanceof Collection) return !((Collection<?>) value).isEmpty();
+        if (value instanceof Map) return !((Map<?, ?>) value).isEmpty();
+        return true;
+    }
+
+    private Object resolveKey(Map<String, Object> root, String key) {
+        // hỗ trợ nested: user.name, application.name...
+        String[] parts = key.split("\\.");
+        Object current = root;
+        for (String part : parts) {
+            if (!(current instanceof Map)) return null;
+            current = ((Map<?, ?>) current).get(part);
+            if (current == null) return null;
+        }
+        return current;
+    }
+
+    // Lấy paragraph text (ghép các run)
+    private String getParagraphText(P p) {
+        StringBuilder sb = new StringBuilder();
+        for (Object o : p.getContent()) {
+            Object u = XmlUtils.unwrap(o);
+            if (u instanceof R) {
+                for (Object c : ((R) u).getContent()) {
+                    Object cu = XmlUtils.unwrap(c);
+                    if (cu instanceof Text) {
+                        sb.append(((Text) cu).getValue());
+                    }
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    private String replaceScalars(String text, Map<String, Object> root, String blockKey) {
+        // nếu nằm trong block {{?user}} thì context gốc cho {{name}} là object user
+        Map<String, Object> ctx = root;
+        if (blockKey != null) {
+            Object obj = resolveKey(root, blockKey);
+            if (obj instanceof Map) {
+                //noinspection unchecked
+                ctx = (Map<String, Object>) obj;
+            }
+        }
+
+        Matcher m = SCALAR.matcher(text);
+        StringBuffer sb = new StringBuffer();
+        while (m.find()) {
+            String key = m.group(1).trim();
+            Object value = resolveKey(ctx, key);
+            m.appendReplacement(sb, Matcher.quoteReplacement(value != null ? String.valueOf(value) : ""));
+        }
+        m.appendTail(sb);
+        return sb.toString();
     }
 
     private WordprocessingMLPackage loadTemplate() throws Docx4JException, IOException {
@@ -270,456 +461,5 @@ public class TemplateServiceImpl implements TemplateService {
             }
             return WordprocessingMLPackage.load(is);
         }
-    }
-
-    /* =========================================================
-       1) TABLE DATA – 1 bảng nhiều dòng
-       ========================================================= */
-
-    @SuppressWarnings("unchecked")
-    private void processTablesForList(MainDocumentPart mainDocumentPart,
-                                      Map<String, Object> rootContext) {
-
-        Document wmlDoc = (Document) mainDocumentPart.getJaxbElement();
-        List<Object> bodyContent = wmlDoc.getBody().getContent();
-
-        for (Object el : bodyContent) {
-            Object u = XmlUtils.unwrap(el);
-            if (!(u instanceof Tbl tbl)) {
-                continue;
-            }
-
-            List<Tr> rows = new ArrayList<>();
-            for (Object rowObj : tbl.getContent()) {
-                Object ru = XmlUtils.unwrap(rowObj);
-                if (ru instanceof Tr tr) {
-                    rows.add(tr);
-                }
-            }
-
-            if (rows.isEmpty()) continue;
-
-            int templateIndex = -1;
-            String listName = null;
-
-            // tìm row template
-            for (int i = 0; i < rows.size(); i++) {
-                Tr tr = rows.get(i);
-                String rowText = getRowText(tr);
-                if (rowText == null) continue;
-
-                Matcher m = ROW_LIST_PLACEHOLDER.matcher(rowText);
-                if (m.find()) {
-                    templateIndex = i;
-                    listName = m.group(1); // ví dụ "students"
-                    break;
-                }
-            }
-
-            if (templateIndex == -1 || listName == null) {
-                continue; // bảng không có row template
-            }
-
-            log.debug("Table: template row index={} cho list={}", templateIndex, listName);
-
-            Object data = rootContext.get(listName);
-            if (!(data instanceof List<?> dataList) || dataList.isEmpty()) {
-                // không có data -> xoá row template, giữ header
-                tbl.getContent().remove(templateIndex);
-                log.debug("List {} không có data, xoá row template", listName);
-                continue;
-            }
-
-            Tr templateRow = rows.get(templateIndex);
-            // xoá row template
-            tbl.getContent().remove(templateIndex);
-
-            int insertPos = templateIndex;
-
-            for (Object item : dataList) {
-                Map<String, Object> itemMap = castToMap(item);
-
-                // context = root + listName = item
-                Map<String, Object> combinedContext = new HashMap<>(rootContext);
-                combinedContext.put(listName, itemMap);
-
-                Tr newRow = (Tr) XmlUtils.deepCopy(templateRow);
-                replaceScalarsInRow(newRow, combinedContext);
-                tbl.getContent().add(insertPos++, newRow);
-            }
-
-            log.debug("Nhân bản row template cho list {} với {} dòng", listName, ((List<?>) data).size());
-        }
-    }
-
-    private String getRowText(Tr row) {
-        List<Text> texts = new ArrayList<>();
-
-        new TraversalUtil(row, new Callback() {
-            @Override
-            public List<Object> apply(Object o) {
-                Object u = XmlUtils.unwrap(o);
-                if (u instanceof Text t) {
-                    texts.add(t);
-                }
-                return null;
-            }
-
-            @Override
-            public boolean shouldTraverse(Object o) { return true; }
-
-            @Override
-            public void walkJAXBElements(Object parent) {
-                List<Object> children = getChildren(parent);
-                if (children != null) {
-                    for (Object o : children) {
-                        Object u = XmlUtils.unwrap(o);
-                        apply(u);
-                        walkJAXBElements(u);
-                    }
-                }
-            }
-
-            @Override
-            public List<Object> getChildren(Object o) {
-                return TraversalUtil.getChildrenImpl(o);
-            }
-        });
-
-        if (texts.isEmpty()) return null;
-
-        StringBuilder sb = new StringBuilder();
-        for (Text t : texts) {
-            sb.append(t.getValue());
-        }
-        return sb.toString();
-    }
-
-    private void replaceScalarsInRow(Tr row, Map<String, Object> context) {
-        List<Text> texts = new ArrayList<>();
-
-        new TraversalUtil(row, new Callback() {
-            @Override
-            public List<Object> apply(Object o) {
-                Object u = XmlUtils.unwrap(o);
-                if (u instanceof Text t) {
-                    texts.add(t);
-                }
-                return null;
-            }
-
-            @Override
-            public boolean shouldTraverse(Object o) { return true; }
-
-            @Override
-            public void walkJAXBElements(Object parent) {
-                List<Object> children = getChildren(parent);
-                if (children != null) {
-                    for (Object o : children) {
-                        Object u = XmlUtils.unwrap(o);
-                        apply(u);
-                        walkJAXBElements(u);
-                    }
-                }
-            }
-
-            @Override
-            public List<Object> getChildren(Object o) {
-                return TraversalUtil.getChildrenImpl(o);
-            }
-        });
-
-        if (texts.isEmpty()) return;
-
-        StringBuilder original = new StringBuilder();
-        for (Text t : texts) {
-            original.append(t.getValue());
-        }
-        String originalText = original.toString();
-        if (!originalText.contains("{{")) return;
-
-        String renderedText = templateEngine.render(originalText, context);
-        if (renderedText.equals(originalText)) return;
-
-        boolean first = true;
-        for (Text t : texts) {
-            if (first) {
-                t.setValue(renderedText);
-                first = false;
-            } else {
-                t.setValue("");
-            }
-        }
-    }
-
-    /* =========================================================
-       2) BLOCK & CONDITIONAL – toàn document
-       ========================================================= */
-
-    @SuppressWarnings("unchecked")
-    private void processDocument(MainDocumentPart mainDocumentPart,
-                                 Map<String, Object> rootContext) {
-
-        Document wmlDoc = (Document) mainDocumentPart.getJaxbElement();
-        List<Object> originalContent = wmlDoc.getBody().getContent();
-        List<Object> newContent = new ArrayList<>();
-
-        for (int i = 0; i < originalContent.size(); i++) {
-            Object el = originalContent.get(i);
-            Object unwrapped = XmlUtils.unwrap(el);
-
-            if (!(unwrapped instanceof P p)) {
-                newContent.add(XmlUtils.deepCopy(el));
-                continue;
-            }
-
-            String paraText = getParagraphText(p);
-            if (paraText == null) {
-                P cloned = (P) XmlUtils.deepCopy(p);
-                newContent.add(cloned);
-                continue;
-            }
-
-            String trimmed = paraText.trim();
-
-            /* ---------- 2.1 CONDITIONAL: {{?user}} ... {{/user}} ---------- */
-            Matcher condStart = COND_START_PATTERN.matcher(trimmed);
-            if (condStart.matches()) {
-                String blockName = condStart.group(1);
-                int endIndex = findBlockEnd(originalContent, blockName, i + 1);
-                if (endIndex == -1) {
-                    // treat as normal paragraph
-                    P cloned = (P) XmlUtils.deepCopy(p);
-                    replaceScalarsInParagraph(cloned, rootContext);
-                    newContent.add(cloned);
-                    continue;
-                }
-
-                Object value = rootContext.get(blockName);
-                boolean shouldRender = evaluateCondition(value);
-
-                if (shouldRender) {
-                    List<Object> body = originalContent.subList(i + 1, endIndex);
-                    for (Object bodyEl : body) {
-                        Object copy = XmlUtils.deepCopy(bodyEl);
-                        Object bodyUnwrapped = XmlUtils.unwrap(copy);
-                        if (bodyUnwrapped instanceof P bodyPara) {
-                            replaceScalarsInParagraph(bodyPara, rootContext);
-                        }
-                        newContent.add(copy);
-                    }
-                }
-                i = endIndex; // skip to end
-                continue;
-            }
-
-            /* ---------- 2.2 BLOCK LIST/OBJECT: {{students}} ... {{/students}} ---------- */
-            Matcher startMatcher = BLOCK_START_PATTERN.matcher(trimmed);
-            if (startMatcher.matches()) {
-                String blockName = startMatcher.group(1);
-
-                int endIndex = findBlockEnd(originalContent, blockName, i + 1);
-                if (endIndex == -1) {
-                    P cloned = (P) XmlUtils.deepCopy(p);
-                    replaceScalarsInParagraph(cloned, rootContext);
-                    newContent.add(cloned);
-                    continue;
-                }
-
-                List<Object> body = originalContent.subList(i + 1, endIndex);
-                Object blockData = rootContext.get(blockName);
-
-                if (blockData instanceof List<?> list) {
-                    for (Object item : list) {
-                        Map<String, Object> subContext = castToMap(item);
-                        for (Object bodyEl : body) {
-                            Object copy = XmlUtils.deepCopy(bodyEl);
-                            Object bodyUnwrapped = XmlUtils.unwrap(copy);
-                            if (bodyUnwrapped instanceof P bodyPara) {
-                                replaceScalarsInParagraph(bodyPara, subContext);
-                            }
-                            newContent.add(copy);
-                        }
-                    }
-                } else if (blockData instanceof Map<?, ?> map) {
-                    Map<String, Object> subContext = (Map<String, Object>) map;
-                    for (Object bodyEl : body) {
-                        Object copy = XmlUtils.deepCopy(bodyEl);
-                        Object bodyUnwrapped = XmlUtils.unwrap(copy);
-                        if (bodyUnwrapped instanceof P bodyPara) {
-                            replaceScalarsInParagraph(bodyPara, subContext);
-                        }
-                        newContent.add(copy);
-                    }
-                }
-                // nếu không có data phù hợp thì bỏ luôn block
-                i = endIndex;
-                continue;
-            }
-
-            /* ---------- 2.3 END mồ côi -> bỏ ---------- */
-            Matcher endMatcher = BLOCK_END_PATTERN.matcher(trimmed);
-            if (endMatcher.matches()) {
-                continue;
-            }
-
-            /* ---------- 2.4 Paragraph thường ---------- */
-            P cloned = (P) XmlUtils.deepCopy(p);
-            replaceScalarsInParagraph(cloned, rootContext);
-            newContent.add(cloned);
-        }
-
-        originalContent.clear();
-        originalContent.addAll(newContent);
-    }
-
-    private int findBlockEnd(List<Object> content, String blockName, int fromIndex) {
-        for (int j = fromIndex; j < content.size(); j++) {
-            Object elEnd = content.get(j);
-            Object uEnd = XmlUtils.unwrap(elEnd);
-            if (uEnd instanceof P pEnd) {
-                String endText = getParagraphText(pEnd);
-                if (endText != null) {
-                    Matcher endMatcher = BLOCK_END_PATTERN.matcher(endText.trim());
-                    if (endMatcher.matches() && blockName.equals(endMatcher.group(1))) {
-                        return j;
-                    }
-                }
-            }
-        }
-        return -1;
-    }
-
-    private boolean evaluateCondition(Object value) {
-        if (value == null) return false;
-        if (value instanceof Boolean b) return b;
-        if (value instanceof Collection<?> c) return !c.isEmpty();
-        if (value instanceof Map<?, ?> m) return !m.isEmpty();
-        // primitive hoặc object bất kỳ khác null => true
-        return true;
-    }
-
-    /* =========================================================
-       Helpers: paragraph scalar
-       ========================================================= */
-
-    private String getParagraphText(P paragraph) {
-        List<Text> texts = new ArrayList<>();
-
-        new TraversalUtil(paragraph, new Callback() {
-            @Override
-            public List<Object> apply(Object o) {
-                Object u = XmlUtils.unwrap(o);
-                if (u instanceof Text t) {
-                    texts.add(t);
-                }
-                return null;
-            }
-
-            @Override
-            public boolean shouldTraverse(Object o) { return true; }
-
-            @Override
-            public void walkJAXBElements(Object parent) {
-                List<Object> children = getChildren(parent);
-                if (children != null) {
-                    for (Object o : children) {
-                        Object u = XmlUtils.unwrap(o);
-                        apply(u);
-                        walkJAXBElements(u);
-                    }
-                }
-            }
-
-            @Override
-            public List<Object> getChildren(Object o) {
-                return TraversalUtil.getChildrenImpl(o);
-            }
-        });
-
-        if (texts.isEmpty()) return null;
-
-        StringBuilder sb = new StringBuilder();
-        for (Text t : texts) sb.append(t.getValue());
-        return sb.toString();
-    }
-
-    private void replaceScalarsInParagraph(P paragraph, Map<String, Object> context) {
-        List<Text> texts = new ArrayList<>();
-
-        new TraversalUtil(paragraph, new Callback() {
-            @Override
-            public List<Object> apply(Object o) {
-                Object u = XmlUtils.unwrap(o);
-                if (u instanceof Text t) {
-                    texts.add(t);
-                }
-                return null;
-            }
-
-            @Override
-            public boolean shouldTraverse(Object o) { return true; }
-
-            @Override
-            public void walkJAXBElements(Object parent) {
-                List<Object> children = getChildren(parent);
-                if (children != null) {
-                    for (Object o : children) {
-                        Object u = XmlUtils.unwrap(o);
-                        apply(u);
-                        walkJAXBElements(u);
-                    }
-                }
-            }
-
-            @Override
-            public List<Object> getChildren(Object o) {
-                return TraversalUtil.getChildrenImpl(o);
-            }
-        });
-
-        if (texts.isEmpty()) return;
-
-        StringBuilder original = new StringBuilder();
-        for (Text t : texts) original.append(t.getValue());
-        String originalText = original.toString();
-
-        if (!originalText.contains("{{")) return;
-
-        String renderedText = templateEngine.render(originalText, context);
-        if (renderedText.equals(originalText)) return;
-
-        boolean first = true;
-        for (Text t : texts) {
-            if (first) {
-                t.setValue(renderedText);
-                first = false;
-            } else {
-                t.setValue("");
-            }
-        }
-    }
-
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> castToMap(Object item) {
-        if (item instanceof Map<?, ?> m) {
-            return (Map<String, Object>) m;
-        }
-        return Map.of(".", item);
-    }
-
-    @SuppressWarnings("unchecked")
-    private Object resolveKey(String key, Map<String, Object> context) {
-        if (!key.contains(".")) {
-            return context.get(key);
-        }
-        String[] parts = key.split("\\.");
-        Object current = context;
-        for (String part : parts) {
-            if (!(current instanceof Map)) return null;
-            current = ((Map<String, Object>) current).get(part);
-            if (current == null) return null;
-        }
-        return current;
     }
 }
