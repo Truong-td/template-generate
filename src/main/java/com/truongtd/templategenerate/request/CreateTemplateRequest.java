@@ -9,8 +9,6 @@ import java.util.List;
 public class CreateTemplateRequest {
 
     private String textData;
-
     private String tableData;
-
-    private List<FlexDataDTO> flexDataList;
+    private String flexData;
 }
