@@ -46,6 +46,9 @@ public class TemplateServiceImpl implements TemplateService {
             Pattern.compile("\\{\\{([a-zA-Z0-9_]+)\\.[^}]+}}");
     private static final Pattern LIST_BLOCK_START =
             Pattern.compile("\\{\\{([a-zA-Z0-9_]+)}}");
+    // paragraph chỉ chứa 1 scalar: {{avatar}}, {{user.avatar}}, ...
+    private static final Pattern IMAGE_ONLY_PLACEHOLDER =
+            Pattern.compile("\\{\\{([^{}]+)}}");
 
     @Override
     public byte[] generateDocx(GenerateTemplateRequest request) {
@@ -77,6 +80,69 @@ public class TemplateServiceImpl implements TemplateService {
             throw new RuntimeException("Error generating template", e);
         }
     }
+
+    private boolean handleImagePlaceholder(WordprocessingMLPackage pkg,
+                                           P paragraph,
+                                           Map<String, Object> ctx) throws Docx4JException {
+        String txt = getParagraphText(paragraph);
+        if (txt == null) return false;
+
+        txt = txt.trim();
+        Matcher m = IMAGE_ONLY_PLACEHOLDER.matcher(txt);
+        if (!m.matches()) {
+            return false; // paragraph không phải dạng "{{key}}" duy nhất
+        }
+
+        String key = m.group(1).trim(); // avatar, user.avatar, ...
+        Object val = resolveKey(ctx, key);
+        if (val == null) {
+            // không có dữ liệu => xoá paragraph
+            deleteParagraph(pkg, paragraph);
+            return true;
+        }
+
+        String path = String.valueOf(val);
+        // nếu không giống đường dẫn ảnh -> coi như text bình thường
+        if (!looksLikeImagePath(path)) {
+            return false;
+        }
+
+        try {
+            Map<String, Object> imageData = new HashMap<>();
+            imageData.put("bucket", null);
+            imageData.put("path", path);
+
+            Map<String, Object> block = new HashMap<>();
+            block.put("imageData", imageData);
+
+            P imgP = createFlexImageParagraph(pkg, block);
+
+            Body body = pkg.getMainDocumentPart().getContents().getBody();
+            List<Object> content = body.getContent();
+            int idx = content.indexOf(paragraph);
+            if (idx >= 0) {
+                content.set(idx, imgP);
+            } else {
+                content.add(imgP);
+                deleteParagraph(pkg, paragraph);
+            }
+            return true;
+        } catch (Exception e) {
+            throw new RuntimeException("Error inserting image for key=" + key
+                    + ", path=" + path, e);
+        }
+    }
+
+    // simple heuristic: path nhìn giống ảnh (URL, classpath, file ảnh)
+    private boolean looksLikeImagePath(String path) {
+        String p = path.toLowerCase(Locale.ROOT).trim();
+        if (p.startsWith("http://") || p.startsWith("https://") || p.startsWith("classpath:")) {
+            return true;
+        }
+        return p.endsWith(".png") || p.endsWith(".jpg") || p.endsWith(".jpeg")
+                || p.endsWith(".gif") || p.endsWith(".bmp") || p.endsWith(".webp");
+    }
+
 
     // ===================== ROOT CONTEXT =====================
 
@@ -673,7 +739,6 @@ public class TemplateServiceImpl implements TemplateService {
                     boolean show = isTruthy(blockObj);
 
                     if (show) {
-                        // context cho block = root + object con (nếu là Map)
                         Map<String, Object> ctxForBlock = new HashMap<>(root);
                         if (blockObj instanceof Map) {
                             @SuppressWarnings("unchecked")
@@ -685,19 +750,27 @@ public class TemplateServiceImpl implements TemplateService {
                             String t = getParagraphText(blockP);
                             if (t == null) t = "";
 
-                            // xoá marker {{?key}} & {{/key}}
+                            // bỏ marker điều kiện
                             t = t.replace("{{?" + currentKey + "}}", "")
                                     .replace("{{/" + currentKey + "}}", "");
+                            setParagraphText(blockP, t);
 
-                            // replace scalar trong block theo ctxForBlock
-                            if (t.contains("{{")) {
-                                t = replaceScalars(t, ctxForBlock);
+                            // 1) Nếu paragraph là placeholder ảnh duy nhất -> chèn ảnh
+                            if (handleImagePlaceholder(pkg, blockP, ctxForBlock)) {
+                                continue;
                             }
 
-                            if (t.trim().isEmpty()) {
+                            // 2) Còn lại xử lý scalar text như cũ
+                            String textAfter = getParagraphText(blockP);
+                            if (textAfter != null && textAfter.contains("{{")) {
+                                textAfter = replaceScalars(textAfter, ctxForBlock);
+                                if (textAfter.trim().isEmpty()) {
+                                    deleteParagraph(pkg, blockP);
+                                } else {
+                                    setParagraphText(blockP, textAfter);
+                                }
+                            } else if (textAfter == null || textAfter.trim().isEmpty()) {
                                 deleteParagraph(pkg, blockP);
-                            } else {
-                                setParagraphText(blockP, t);
                             }
                         }
                     } else {
@@ -715,7 +788,9 @@ public class TemplateServiceImpl implements TemplateService {
             }
 
             // ---- ngoài mọi block điều kiện ----
-
+            if (handleImagePlaceholder(pkg, p, root)) {
+                continue;
+            }
             // chỉ xử lý scalar nếu paragraph còn chứa {{ }}
             if (!text.contains("{{")) continue;
 
