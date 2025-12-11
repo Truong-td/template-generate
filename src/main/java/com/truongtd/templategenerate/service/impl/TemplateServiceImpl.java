@@ -21,6 +21,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.math.BigInteger;
 import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -267,9 +268,21 @@ public class TemplateServiceImpl implements TemplateService {
         Map<String, Object> tableData = (Map<String, Object>) block.get("tableData");
         List<List<Map<String, Object>>> matrix =
                 (List<List<Map<String, Object>>>) tableData.get("data");
-        // List<Double> colSizes = (List<Double>) tableData.get("colSizes"); // dùng nếu cần
 
         Tbl tbl = new Tbl();
+
+        // ====== THÊM ĐOẠN NÀY: TẠO BORDER CHO BẢNG ======
+        TblPr tblPr = new TblPr();
+        TblBorders borders = new TblBorders();
+        borders.setTop(createBorder());
+        borders.setBottom(createBorder());
+        borders.setLeft(createBorder());
+        borders.setRight(createBorder());
+        borders.setInsideH(createBorder());
+        borders.setInsideV(createBorder());
+        tblPr.setTblBorders(borders);
+        tbl.setTblPr(tblPr);
+        // ================================================
 
         for (List<Map<String, Object>> rowData : matrix) {
             Tr tr = new Tr();
@@ -299,9 +312,18 @@ public class TemplateServiceImpl implements TemplateService {
         return tbl;
     }
 
-    @SuppressWarnings("unchecked")
+    private CTBorder createBorder() {
+        CTBorder border = new CTBorder();
+        border.setVal(STBorder.SINGLE);            // đường kẻ liền
+        border.setSz(BigInteger.valueOf(4));       // độ dày
+        border.setSpace(BigInteger.ZERO);
+        border.setColor("000000");                 // màu đen
+        return border;
+    }
+
     private P createImageParagraph(WordprocessingMLPackage pkg,
                                    Map<String, Object> block) throws Exception {
+        @SuppressWarnings("unchecked")
         Map<String, Object> imageData = (Map<String, Object>) block.get("imageData");
         if (imageData == null) return new P();
 
@@ -309,13 +331,26 @@ public class TemplateServiceImpl implements TemplateService {
         String path = (String) imageData.get("path");
 
         byte[] bytes = loadImageBytes(bucket, path);
-        if (bytes == null || bytes.length == 0) return new P();
+        if (bytes == null || bytes.length == 0) {
+            // Để dễ debug, đặt placeholder text
+            P p = new P();
+            R r = new R();
+            Text t = new Text();
+            t.setValue("[IMAGE NOT FOUND: " + path + "]");
+            r.getContent().add(t);
+            p.getContent().add(r);
+            return p;
+        }
 
         BinaryPartAbstractImage imagePart =
                 BinaryPartAbstractImage.createImagePart(pkg, bytes);
 
+        // id1, id2 chỉ cần unique tương đối
+        int id1 = (int) (Math.random() * 10000);
+        int id2 = (int) (Math.random() * 10000);
+
         Inline inline = imagePart.createImageInline(
-                "flex-img", "flex-img", 0, 1, 6000, false);
+                "flex-img", "flex-img", id1, id2, 6000, false);
 
         Drawing drawing = new Drawing();
         drawing.getAnchorOrInline().add(inline);
@@ -328,6 +363,54 @@ public class TemplateServiceImpl implements TemplateService {
         return p;
     }
 
+//    private byte[] loadImageBytes(String bucket, String path) {
+//        if (path == null || path.trim().isEmpty()) {
+//            return new byte[0];
+//        }
+//        path = path.trim();
+//
+//        try {
+//            // 1) URL
+//            if (path.startsWith("http://") || path.startsWith("https://")) {
+//                try (InputStream is = new URL(path).openStream()) {
+//                    return IOUtils.toByteArray(is);
+//                }
+//            }
+//
+//            // 2) classpath:...
+//            if (path.startsWith("classpath:")) {
+//                String cp = path.substring("classpath:".length());
+//                String resourcePath = cp.startsWith("/") ? cp : "/" + cp;
+//                try (InputStream is = getClass().getResourceAsStream(resourcePath)) {
+//                    if (is == null) {
+//                        throw new FileNotFoundException("Classpath resource not found: " + cp);
+//                    }
+//                    return IOUtils.toByteArray(is);
+//                }
+//            }
+//
+//            // 3) file hệ thống
+//            Path filePath;
+//            if (Paths.get(path).isAbsolute()) {
+//                filePath = Paths.get(path);
+//            } else {
+//                if (imageBaseDir != null && !imageBaseDir.isEmpty()) {
+//                    if (bucket != null && !bucket.isEmpty()) {
+//                        filePath = Paths.get(imageBaseDir, bucket, path);
+//                    } else {
+//                        filePath = Paths.get(imageBaseDir, path);
+//                    }
+//                } else {
+//                    filePath = Paths.get(path);
+//                }
+//            }
+//            return Files.readAllBytes(filePath);
+//
+//        } catch (IOException e) {
+//            throw new RuntimeException("Cannot load image from path=" + path
+//                    + ", bucket=" + bucket, e);
+//        }
+//    }
     private byte[] loadImageBytes(String bucket, String path) {
         if (path == null || path.trim().isEmpty()) {
             return new byte[0];
@@ -335,7 +418,7 @@ public class TemplateServiceImpl implements TemplateService {
         path = path.trim();
 
         try {
-            // 1) URL
+            // 1) URL http/https
             if (path.startsWith("http://") || path.startsWith("https://")) {
                 try (InputStream is = new URL(path).openStream()) {
                     return IOUtils.toByteArray(is);
@@ -354,24 +437,24 @@ public class TemplateServiceImpl implements TemplateService {
                 }
             }
 
-            // 3) file hệ thống
+            // 3) file hệ thống (absolute hoặc kết hợp base-dir + bucket)
             Path filePath;
             if (Paths.get(path).isAbsolute()) {
                 filePath = Paths.get(path);
-            } else {
-                if (imageBaseDir != null && !imageBaseDir.isEmpty()) {
-                    if (bucket != null && !bucket.isEmpty()) {
-                        filePath = Paths.get(imageBaseDir, bucket, path);
-                    } else {
-                        filePath = Paths.get(imageBaseDir, path);
-                    }
+            } else if (imageBaseDir != null && !imageBaseDir.isEmpty()) {
+                if (bucket != null && !bucket.isEmpty()) {
+                    filePath = Paths.get(imageBaseDir, bucket, path);
                 } else {
-                    filePath = Paths.get(path);
+                    filePath = Paths.get(imageBaseDir, path);
                 }
+            } else {
+                filePath = Paths.get(path);
             }
+
             return Files.readAllBytes(filePath);
 
         } catch (IOException e) {
+            // Cho log rõ ràng, để nếu ảnh không lên còn biết lý do
             throw new RuntimeException("Cannot load image from path=" + path
                     + ", bucket=" + bucket, e);
         }
@@ -383,16 +466,25 @@ public class TemplateServiceImpl implements TemplateService {
         MainDocumentPart main = pkg.getMainDocumentPart();
         Body body = main.getContents().getBody();
 
+        // listKey đã được dùng trong bảng
+        Set<String> listKeysUsedInTables = new HashSet<>();
+
         for (Object bodyObj : new ArrayList<>(body.getContent())) {
             Object u = XmlUtils.unwrap(bodyObj);
             if (!(u instanceof Tbl)) continue;
 
             Tbl tbl = (Tbl) u;
-            handleTable(tbl, root);
+            handleTable(tbl, root, listKeysUsedInTables);
         }
+
+        // fallback: list nào là List nhưng CHƯA dùng trong table
+        renderListFallbackAsText(main, root, listKeysUsedInTables);
     }
 
-    private void handleTable(Tbl tbl, Map<String, Object> root) {
+    private void handleTable(Tbl tbl,
+                             Map<String, Object> root,
+                             Set<String> listKeysUsedInTables) {
+
         List<Tr> rows = new ArrayList<>();
         for (Object rObj : tbl.getContent()) {
             rows.add((Tr) XmlUtils.unwrap(rObj));
@@ -402,7 +494,8 @@ public class TemplateServiceImpl implements TemplateService {
             String rowText = getRowText(row);
             Matcher m = LIST_IN_ROW.matcher(rowText);
             if (m.find()) {
-                String listKey = m.group(1); // students, orders, ...
+                String listKey = m.group(1); // students, subjects, orders,...
+                listKeysUsedInTables.add(listKey);     // ĐÁNH DẤU đã dùng table
                 fillTableForList(tbl, row, listKey, root);
             }
         }
@@ -424,13 +517,111 @@ public class TemplateServiceImpl implements TemplateService {
         int index = 1;
         for (Object item : list) {
             Map<String, Object> itemCtx = toMap(item);
-            itemCtx.put("index", index++); // dùng {{listKey.index}} nếu muốn
+            itemCtx.put("index", index++); // {{listKey.index}} nếu muốn dùng STT
 
             Tr newRow = XmlUtils.deepCopy(templateRow);
             replaceRowScalars(newRow, listKey, itemCtx);
             tbl.getContent().add(insertIndex++, newRow);
         }
     }
+
+    @SuppressWarnings("unchecked")
+    private void renderListFallbackAsText(MainDocumentPart main,
+                                          Map<String, Object> root,
+                                          Set<String> listKeysUsedInTables) throws Docx4JException {
+
+        Body body = main.getContents().getBody();
+        List<Object> content = body.getContent();
+
+        for (Map.Entry<String, Object> e : root.entrySet()) {
+            String key = e.getKey();
+            Object val = e.getValue();
+
+            // chỉ xử lý list
+            if (!(val instanceof List)) continue;
+
+            // đã render bằng TABLE rồi thì bỏ qua (=> students sẽ không bị fallback)
+            if (listKeysUsedInTables.contains(key)) continue;
+
+            List<?> list = (List<?>) val;
+
+            String tag = "{{" + key + "}}";
+            int placeholderIndex = -1;
+            for (int i = 0; i < content.size(); i++) {
+                Object u = XmlUtils.unwrap(content.get(i));
+                if (u instanceof P) {
+                    P p = (P) u;
+                    String txt = getParagraphText(p);
+                    if (txt != null && txt.contains(tag)) {
+                        placeholderIndex = i;
+                        break;
+                    }
+                }
+            }
+            if (placeholderIndex == -1) {
+                // không có {{key}} trong template => không render text
+                continue;
+            }
+
+            // xóa paragraph chứa {{key}}
+            content.remove(placeholderIndex);
+
+            int insertIndex = placeholderIndex;
+            for (Object item : list) {
+                if (item instanceof Map) {
+                    insertIndex += renderMapItemAsText(body, insertIndex, key,
+                            (Map<String, Object>) item);
+                } else {
+                    content.add(insertIndex++, createPlainParagraph("- " + String.valueOf(item)));
+                }
+                // dòng trống giữa các item
+                content.add(insertIndex++, createPlainParagraph(""));
+            }
+        }
+    }
+
+    private int renderMapItemAsText(Body body,
+                                    int insertIndex,
+                                    String listKey,
+                                    Map<String, Object> item) {
+
+        List<Object> content = body.getContent();
+        int added = 0;
+
+        // 1) Dòng đầu: "- name"
+        Object nameVal = item.get("name");
+        if (nameVal == null) {
+            content.add(insertIndex++, createPlainParagraph("- " + item.toString()));
+            return ++added;
+        }
+
+        content.add(insertIndex++, createPlainParagraph("- " + String.valueOf(nameVal)));
+        added++;
+
+        // 2) Các field khác
+        for (Map.Entry<String, Object> entry : item.entrySet()) {
+            String field = entry.getKey();
+            if ("name".equals(field) || "index".equals(field)) continue;
+
+            Object v = entry.getValue();
+            String label = field;
+
+            if ("subjects".equals(listKey)) {
+                if ("credit".equals(field)) {
+                    label = "Tín chỉ";
+                } else if ("score".equals(field)) {
+                    label = "Điểm";
+                }
+            }
+
+            String valueStr = v != null ? String.valueOf(v) : "";
+            content.add(insertIndex++, createPlainParagraph("| " + label + ": " + valueStr));
+            added++;
+        }
+
+        return added;
+    }
+
 
     @SuppressWarnings("unchecked")
     private Map<String, Object> toMap(Object item) {
@@ -589,7 +780,13 @@ public class TemplateServiceImpl implements TemplateService {
                 continue;
             }
 
-            // ngoài block: scalar thường
+            // ==== ngoài block ====
+            text = getParagraphText(p);
+            // Nếu paragraph không chứa placeholder => bỏ qua, KHÔNG sửa nội dung
+            if (!text.contains("{{")) {
+                continue;
+            }
+
             String replaced = replaceScalars(text, root, null);
             setParagraphText(p, replaced);
         }
