@@ -50,6 +50,9 @@ public class TemplateServiceImpl implements TemplateService {
     private static final Pattern IMAGE_ONLY_PLACEHOLDER =
             Pattern.compile("\\{\\{([^{}]+)}}");
 
+    private static final Pattern COND_START = Pattern.compile("\\{\\{\\?([^}]+)}}");
+    private static final Pattern COND_END   = Pattern.compile("\\{\\{\\/([^}]+)}}");
+
     @Override
     public byte[] generateDocx(GenerateTemplateRequest request) {
         try {
@@ -63,6 +66,9 @@ public class TemplateServiceImpl implements TemplateService {
 
             // 1. FlexData
             processFlexData(pkg, data.getFlexData());
+
+            // 1) condition trước để xóa được cả table
+            processConditionalBlocks(pkg, context);
 
             // 2. List-block cho table + text
             processListBlocks(pkg, context);
@@ -79,6 +85,114 @@ public class TemplateServiceImpl implements TemplateService {
         } catch (Exception e) {
             throw new RuntimeException("Error generating template", e);
         }
+    }
+
+    private void processConditionalBlocks(WordprocessingMLPackage pkg, Map<String, Object> root) throws Docx4JException {
+        Body body = pkg.getMainDocumentPart().getContents().getBody();
+        List<Object> c = body.getContent();
+
+        int i = 0;
+        while (i < c.size()) {
+            Object u = XmlUtils.unwrap(c.get(i));
+            if (!(u instanceof P)) { i++; continue; }
+
+            String s = Optional.ofNullable(getParagraphText((P) u)).orElse("").trim();
+            Matcher ms = COND_START.matcher(s);
+            if (!ms.matches()) { i++; continue; }
+
+            String key = ms.group(1).trim().replaceAll("\\s+", ""); // remove spaces in key
+
+            int end = -1;
+            for (int j = i + 1; j < c.size(); j++) {
+                Object uj = XmlUtils.unwrap(c.get(j));
+                if (uj instanceof P) {
+                    String ej = Optional.ofNullable(getParagraphText((P) uj)).orElse("").trim();
+                    Matcher me = COND_END.matcher(ej);
+                    if (me.matches()) {
+                        String endKey = me.group(1).trim().replaceAll("\\s+", "");
+                        if (endKey.equals(key)) { end = j; break; }
+                    }
+                }
+            }
+            if (end == -1) { i++; continue; }
+
+            Object condVal = resolveKey(root, key);
+            boolean show = isTruthy(condVal);
+
+            if (!show) {
+                // FALSE: xoá toàn block (kể cả TABLE)
+                c.subList(i, end + 1).clear();
+                continue;
+            }
+
+            // TRUE: chỉ xoá marker nếu block chứa TABLE (để tránh ảnh hưởng user/text block)
+            boolean hasTblInside = false;
+            for (int k = i + 1; k < end; k++) {
+                Object uk = XmlUtils.unwrap(c.get(k));
+                if (uk instanceof Tbl) { hasTblInside = true; break; }
+            }
+
+            if (hasTblInside) {
+                // block có TABLE: xoá marker start/end, giữ nội dung
+                c.remove(end); // end marker paragraph
+                c.remove(i);   // start marker paragraph
+                continue;
+            }
+
+            // block chỉ có text: giữ marker để processTextBlocks xử lý (merge context user)
+            i++;
+        }
+    }
+
+    private void applyVerticalMergeContinueAndClear(Tr row) {
+        for (Object cellObj : row.getContent()) {
+            Object cu = XmlUtils.unwrap(cellObj);
+            if (!(cu instanceof Tc tc)) continue;
+
+            TcPr pr = tc.getTcPr();
+            if (pr == null) continue;
+
+            TcPrInner.VMerge vm = pr.getVMerge();
+            if (vm == null) continue;
+
+            // các row sau phải là CONTINUE + clear text
+            vm.setVal("continue");
+            tc.getContent().clear();
+            tc.getContent().add(new P());
+        }
+    }
+
+    private void clearNonListCellsForSubsequentRow(Tr row, String listKey) {
+        if (row == null) return;
+
+        String marker = "{{" + listKey + ".";
+        for (Object cellObj : row.getContent()) {
+            Object cu = XmlUtils.unwrap(cellObj);
+            if (!(cu instanceof Tc)) continue;
+            Tc tc = (Tc) cu;
+
+            String cellText = getTcText(tc);
+            if (cellText == null) cellText = "";
+
+            // Nếu cell KHÔNG chứa {{criteriaList.xxx}} thì coi là "tĩnh" -> clear
+            if (!cellText.contains(marker)) {
+                // clear toàn bộ content của cell
+                tc.getContent().clear();
+                tc.getContent().add(new P());
+            }
+        }
+    }
+
+    private String getTcText(Tc tc) {
+        StringBuilder sb = new StringBuilder();
+        for (Object o : tc.getContent()) {
+            Object u = XmlUtils.unwrap(o);
+            if (u instanceof P) {
+                String t = getParagraphText((P) u);
+                if (t != null) sb.append(t);
+            }
+        }
+        return sb.toString();
     }
 
     private boolean handleImagePlaceholder(WordprocessingMLPackage pkg,
@@ -240,6 +354,96 @@ public class TemplateServiceImpl implements TemplateService {
         }
         return -1;
     }
+//    @SuppressWarnings("unchecked")
+//    private List<Object> buildListBlockOutput(String listKey,
+//                                              List<?> list,
+//                                              List<Object> templateNodes,
+//                                              Map<String, Object> root) {
+//        List<Object> out = new ArrayList<>();
+//
+//        List<Tbl> tables = new ArrayList<>();
+//        List<Object> nonTableNodes = new ArrayList<>();
+//
+//        for (Object node : templateNodes) {
+//            Object u = XmlUtils.unwrap(node);
+//            if (u instanceof Tbl) {
+//                tables.add((Tbl) u);
+//            } else if (u instanceof P && isParagraphEmpty((P) u)) {
+//                // paragraph rỗng thì bỏ qua, ko tính là non-table
+//                continue;
+//            } else {
+//                nonTableNodes.add(node);
+//            }
+//        }
+//
+//        // ===== CASE 1: block chỉ có đúng 1 TABLE (students) -> TABLE MODE =====
+//        if (tables.size() == 1 && nonTableNodes.isEmpty()) {
+//            Tbl templateTbl = tables.get(0);
+//
+//            // clone cả bảng làm bảng output
+//            Tbl outTbl = XmlUtils.deepCopy(templateTbl);
+//            out.add(outTbl);
+//
+//            // lấy list row trong bảng output (để replace cho item đầu tiên)
+//            List<Tr> outRows = new ArrayList<>();
+//            for (Object rObj : outTbl.getContent()) {
+//                outRows.add((Tr) XmlUtils.unwrap(rObj));
+//            }
+//
+//            // xác định các row nào là "template row" (có placeholder {{...}})
+//            List<Integer> templateRowIdx = new ArrayList<>();
+//            for (int idx = 0; idx < outRows.size(); idx++) {
+//                String rowText = getRowText(outRows.get(idx));
+//                if (rowText != null && rowText.contains("{{")) {
+//                    templateRowIdx.add(idx);
+//                }
+//            }
+//
+//            // lấy bản gốc template row từ templateTbl (để dùng cho item 2,3,...)
+//            List<Tr> originalTemplateRows = new ArrayList<>();
+//            for (int idx : templateRowIdx) {
+//                Tr r = (Tr) XmlUtils.unwrap(templateTbl.getContent().get(idx));
+//                originalTemplateRows.add(r);
+//            }
+//
+//            // --- item thứ 1: replace trực tiếp lên row trong outTbl ---
+//            Map<String, Object> ctx1 = buildItemContext(listKey, list.get(0), 1, root);
+//            for (int idx : templateRowIdx) {
+//                Tr row = outRows.get(idx);
+//                replaceScalarsDeep(row, ctx1);
+//            }
+//
+//            // --- item thứ 2 trở đi: append thêm row vào cùng bảng ---
+//            int insertPos = outTbl.getContent().size();
+//            for (int itemIndex = 1; itemIndex < list.size(); itemIndex++) {
+//                Map<String, Object> ctx = buildItemContext(listKey, list.get(itemIndex),
+//                        itemIndex + 1, root);
+//                for (Tr templRow : originalTemplateRows) {
+//                    Tr newRow = XmlUtils.deepCopy(templRow);
+//                    applyVerticalMergeContinueAndClear(newRow);
+//                    replaceScalarsDeep(newRow, ctx);
+//                    outTbl.getContent().add(insertPos++, newRow);
+//                }
+//            }
+//
+//            return out;
+//        }
+//
+//        // ===== CASE 2: TEXT MODE (subjects, orders, ...) =====
+//        // -> lặp nguyên block cho mỗi item (behavior cũ)
+//        for (int itemIndex = 0; itemIndex < list.size(); itemIndex++) {
+//            Map<String, Object> ctx = buildItemContext(listKey, list.get(itemIndex),
+//                    itemIndex + 1, root);
+//
+//            for (Object tplNode : templateNodes) {
+//                Object copy = XmlUtils.deepCopy(tplNode);
+//                replaceScalarsDeep(copy, ctx);
+//                out.add(copy);
+//            }
+//        }
+//
+//        return out;
+//    }
     @SuppressWarnings("unchecked")
     private List<Object> buildListBlockOutput(String listKey,
                                               List<?> list,
@@ -247,6 +451,7 @@ public class TemplateServiceImpl implements TemplateService {
                                               Map<String, Object> root) {
         List<Object> out = new ArrayList<>();
 
+        // tách table nodes và non-table nodes
         List<Tbl> tables = new ArrayList<>();
         List<Object> nonTableNodes = new ArrayList<>();
 
@@ -255,28 +460,29 @@ public class TemplateServiceImpl implements TemplateService {
             if (u instanceof Tbl) {
                 tables.add((Tbl) u);
             } else if (u instanceof P && isParagraphEmpty((P) u)) {
-                // paragraph rỗng thì bỏ qua, ko tính là non-table
+                // bỏ paragraph trống
                 continue;
             } else {
                 nonTableNodes.add(node);
             }
         }
 
-        // ===== CASE 1: block chỉ có đúng 1 TABLE (students) -> TABLE MODE =====
+        // ===================== TABLE MODE =====================
+        // block chỉ có đúng 1 table và không có node khác (ngoài paragraph trống)
         if (tables.size() == 1 && nonTableNodes.isEmpty()) {
             Tbl templateTbl = tables.get(0);
 
-            // clone cả bảng làm bảng output
+            // bảng output (giữ header 1 lần)
             Tbl outTbl = XmlUtils.deepCopy(templateTbl);
             out.add(outTbl);
 
-            // lấy list row trong bảng output (để replace cho item đầu tiên)
+            // rows của bảng output (để replace cho item #1)
             List<Tr> outRows = new ArrayList<>();
             for (Object rObj : outTbl.getContent()) {
                 outRows.add((Tr) XmlUtils.unwrap(rObj));
             }
 
-            // xác định các row nào là "template row" (có placeholder {{...}})
+            // xác định những row là "template row" (row có placeholder {{...}})
             List<Integer> templateRowIdx = new ArrayList<>();
             for (int idx = 0; idx < outRows.size(); idx++) {
                 String rowText = getRowText(outRows.get(idx));
@@ -285,28 +491,47 @@ public class TemplateServiceImpl implements TemplateService {
                 }
             }
 
-            // lấy bản gốc template row từ templateTbl (để dùng cho item 2,3,...)
-            List<Tr> originalTemplateRows = new ArrayList<>();
-            for (int idx : templateRowIdx) {
-                Tr r = (Tr) XmlUtils.unwrap(templateTbl.getContent().get(idx));
-                originalTemplateRows.add(r);
+            // nếu không có template row => coi như không làm gì (tránh lỗi)
+            if (templateRowIdx.isEmpty()) {
+                return out;
             }
 
-            // --- item thứ 1: replace trực tiếp lên row trong outTbl ---
+            // lấy bản gốc template row từ templateTbl để dùng clone cho item #2+
+            List<Tr> originalTemplateRows = new ArrayList<>();
+            for (int idx : templateRowIdx) {
+                Object srcRowObj = templateTbl.getContent().get(idx);
+                Tr srcRow = (Tr) XmlUtils.unwrap(srcRowObj);
+                originalTemplateRows.add(srcRow);
+            }
+
+            // -------- item #1: replace trực tiếp trên outTbl --------
             Map<String, Object> ctx1 = buildItemContext(listKey, list.get(0), 1, root);
             for (int idx : templateRowIdx) {
                 Tr row = outRows.get(idx);
+                // replace cả row (bao gồm cell)
                 replaceScalarsDeep(row, ctx1);
             }
 
-            // --- item thứ 2 trở đi: append thêm row vào cùng bảng ---
+            // -------- item #2+: clone template rows và append vào outTbl --------
             int insertPos = outTbl.getContent().size();
             for (int itemIndex = 1; itemIndex < list.size(); itemIndex++) {
-                Map<String, Object> ctx = buildItemContext(listKey, list.get(itemIndex),
-                        itemIndex + 1, root);
+                Map<String, Object> ctx = buildItemContext(listKey, list.get(itemIndex), itemIndex + 1, root);
+
                 for (Tr templRow : originalTemplateRows) {
                     Tr newRow = XmlUtils.deepCopy(templRow);
+
+                    // ✅ MERGE FIX: nếu row có vMerge thì chuyển sang continue và clear text trong cell merge
+                    applyVerticalMergeContinueAndClear(newRow);
+
+                    // ✅ fix lặp text kiểu "CTTD: test" nếu template không merge
+                    clearNonListCellsForSubsequentRow(newRow, listKey);
+
                     replaceScalarsDeep(newRow, ctx);
+
+                    // ✅ nếu row sau cùng bị rỗng => bỏ luôn, không add vào table
+                    if (isRowBlank(newRow)) {
+                        continue;
+                    }
                     outTbl.getContent().add(insertPos++, newRow);
                 }
             }
@@ -314,11 +539,10 @@ public class TemplateServiceImpl implements TemplateService {
             return out;
         }
 
-        // ===== CASE 2: TEXT MODE (subjects, orders, ...) =====
-        // -> lặp nguyên block cho mỗi item (behavior cũ)
+        // ===================== TEXT MODE =====================
+        // lặp nguyên block cho mỗi item (subjects, orders dạng text, hoặc block có nhiều node)
         for (int itemIndex = 0; itemIndex < list.size(); itemIndex++) {
-            Map<String, Object> ctx = buildItemContext(listKey, list.get(itemIndex),
-                    itemIndex + 1, root);
+            Map<String, Object> ctx = buildItemContext(listKey, list.get(itemIndex), itemIndex + 1, root);
 
             for (Object tplNode : templateNodes) {
                 Object copy = XmlUtils.deepCopy(tplNode);
@@ -328,6 +552,43 @@ public class TemplateServiceImpl implements TemplateService {
         }
 
         return out;
+    }
+    private boolean isRowBlank(Tr row) {
+        if (row == null) return true;
+
+        for (Object cellObj : row.getContent()) {
+            Object cu = XmlUtils.unwrap(cellObj);
+            if (!(cu instanceof Tc)) continue;
+            Tc tc = (Tc) cu;
+
+            String cellText = getTcText(tc);
+            if (cellText != null && !cellText.trim().isEmpty()) {
+                return false;
+            }
+            // nếu cell có drawing (ảnh) cũng coi là không rỗng
+            if (containsDrawing(tc)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    private boolean containsDrawing(Tc tc) {
+        for (Object o : tc.getContent()) {
+            Object u = XmlUtils.unwrap(o);
+            if (u instanceof P) {
+                P p = (P) u;
+                for (Object rObj : p.getContent()) {
+                    Object ru = XmlUtils.unwrap(rObj);
+                    if (ru instanceof R) {
+                        for (Object rc : ((R) ru).getContent()) {
+                            Object cu = XmlUtils.unwrap(rc);
+                            if (cu instanceof Drawing) return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     @SuppressWarnings("unchecked")
@@ -844,12 +1105,18 @@ public class TemplateServiceImpl implements TemplateService {
         body.getContent().remove(p);
     }
 
-    private boolean isTruthy(Object value) {
-        if (value == null) return false;
-        if (value instanceof Boolean) return (Boolean) value;
-        if (value instanceof String) return !((String) value).trim().isEmpty();
-        if (value instanceof Collection) return !((Collection<?>) value).isEmpty();
-        if (value instanceof Map) return !((Map<?, ?>) value).isEmpty();
+    private boolean isTruthy(Object v) {
+        if (v == null) return false;
+        if (v instanceof Boolean) return (Boolean) v;
+        if (v instanceof String s) {
+            String x = s.trim();
+            if (x.isEmpty()) return false;
+            if ("false".equalsIgnoreCase(x)) return false;
+            if ("true".equalsIgnoreCase(x)) return true;
+            return true;
+        }
+        if (v instanceof Collection<?> c) return !c.isEmpty();
+        if (v instanceof Map<?, ?> m) return !m.isEmpty();
         return true;
     }
 
