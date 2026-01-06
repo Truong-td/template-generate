@@ -1,6 +1,7 @@
 package com.truongtd.templategenerate.helper;
 
 import com.truongtd.templategenerate.dto.TemplateDataDto;
+import com.truongtd.templategenerate.request.GenerateTemplateRequest;
 
 import java.util.HashMap;
 import java.util.List;
@@ -23,4 +24,15 @@ public class TemplateContextBuilder {
 //
 //        return root;
 //    }
+
+    public Map<String, Object> buildRootContext(GenerateTemplateRequest data) {
+        Map<String, Object> root = new HashMap<>();
+        if (data.getTextData() != null) {
+            root.putAll(data.getTextData());
+        }
+        if (data.getTableData() != null) {
+            root.putAll(data.getTableData());
+        }
+        return root;
+    }
 }

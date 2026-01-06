@@ -1,6 +1,5 @@
 package com.truongtd.templategenerate.controller;
 
-import com.truongtd.templategenerate.request.CreateTemplateRequest;
 import com.truongtd.templategenerate.request.GenerateTemplateRequest;
 import com.truongtd.templategenerate.service.TemplateService;
 import org.springframework.http.*;

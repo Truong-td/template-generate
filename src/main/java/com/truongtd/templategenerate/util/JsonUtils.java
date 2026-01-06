@@ -22,11 +22,11 @@ public class JsonUtils {
         }
     }
 
-    public static TemplateDataDto parse(GenerateTemplateRequest req) {
-        TemplateDataDto data = new TemplateDataDto();
-        data.setTextData(parseToMap(req.getTextData()));
-        data.setTableData(parseToMap(req.getTableData()));
-        data.setFlexData(parseToMap(req.getFlexData()));
-        return data;
-    }
+//    public static TemplateDataDto parse(GenerateTemplateRequest req) {
+//        TemplateDataDto data = new TemplateDataDto();
+//        data.setTextData(parseToMap(req.getTextData()));
+//        data.setTableData(parseToMap(req.getTableData()));
+//        data.setFlexData(parseToMap(req.getFlexData()));
+//        return data;
+//    }
 }
